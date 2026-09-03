@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "medical-expert-ai-chat"
+version = "1.0.0"
+description = "Self-contained asynchronous medical information chat assignment"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115,<1.0",
+    "uvicorn[standard]>=0.30,<1.0",
+    "sqlmodel>=0.0.22,<0.1",
+    "SQLAlchemy>=2.0.36,<2.1",
+    "pydantic-settings>=2.6,<3.0",
+    "boto3>=1.35,<2.0",
+]
+
+[project.optional-dependencies]
+frontend = [
+    "streamlit>=1.40,<2.0",
+    "requests>=2.32,<3.0",
+]
+test = [
+    "pytest>=8.3,<9.0",
+    "httpx>=0.27,<1.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["backend*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

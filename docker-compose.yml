@@ -1,0 +1,51 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend.Dockerfile
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      SERVER_HOST: 0.0.0.0
+      SERVER_PORT: 8000
+      DATABASE_URL: sqlite:////app/data/medical_chat.db
+      LOG_FILE: /app/logs/medical_chat.log
+      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+      LLM_MODEL: ${LLM_MODEL:-anthropic.claude-3-5-sonnet-20240620-v1:0}
+      LLM_TEMPERATURE: ${LLM_TEMPERATURE:-0.2}
+      LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-1000}
+      MAX_RETRIES: ${MAX_RETRIES:-3}
+      RETRY_DELAY: ${RETRY_DELAY:-2}
+      MAX_CONCURRENCY: ${MAX_CONCURRENCY:-5}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+    volumes:
+      - medical_chat_data:/app/data
+      - medical_chat_logs:/app/logs
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend.Dockerfile
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      BACKEND_URL: http://backend:8000
+      POLL_INTERVAL: 1
+    ports:
+      - "8501:8501"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  medical_chat_data:
+  medical_chat_logs:
