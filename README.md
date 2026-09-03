@@ -3,8 +3,9 @@
 A self-contained assignment implementation for submitting medical-information questions,
 processing them asynchronously through an LLM, and retrieving answers and persisted statistics.
 It includes a FastAPI backend, a Streamlit HTTP client, SQLite persistence, an `asyncio.Queue`
-worker pool, AWS Bedrock/Claude and mock LLM providers, structured logging, retries, tests, and
-Docker support.
+worker pool, AWS Bedrock and mock LLM providers, structured logging, retries, tests, and Docker
+support. Bedrock is accessed through its model-independent Converse API, so the configured model
+can be Anthropic Claude, Amazon Nova, or another Converse-compatible model.
 
 This application provides general medical information. It is not a diagnostic tool and does not
 replace a licensed healthcare professional.
@@ -28,7 +29,8 @@ asyncio.Queue  --->  fixed async worker pool
              Mock provider      AWS Bedrock Runtime
                                       |
                                       v
-                                   Claude
+                          Configured Bedrock model
+                            (Claude, Nova, etc.)
 ```
 
 `POST /chat` validates and commits a message with `processing` status, enqueues only its ID, and
@@ -56,6 +58,72 @@ session remains open during an external LLM call.
 This is intentionally a self-contained assignment solution. In production, SQLite and the
 in-process queue could be replaced with a transactional database and durable broker/worker
 system, without changing the public API or the provider boundary.
+
+## Quick start with Docker
+
+Docker is the simplest way to run the complete application. The host does not need to run
+`python -m backend.run`; that command is already the backend container's startup command.
+
+### Mock mode (no AWS account or token)
+
+```powershell
+Copy-Item .env.example .env
+docker compose up -d --build
+```
+
+Open:
+
+- Streamlit UI: `http://localhost:8501`
+- FastAPI documentation: `http://localhost:8000/docs`
+- Backend health check: `http://localhost:8000/health`
+
+The example configuration defaults to `LLM_PROVIDER=mock`, so it makes no external request and
+incurs no AWS cost.
+
+### AWS Bedrock mode
+
+Create the private `.env` file if it does not exist, then set a Bedrock API key and a model/profile
+that is valid for the selected source Region. For the currently tested Amazon Nova configuration:
+
+```env
+LLM_PROVIDER=bedrock
+LLM_MODEL=eu.amazon.nova-pro-v1:0
+AWS_REGION=eu-north-1
+AWS_BEARER_TOKEN_BEDROCK=replace-with-your-real-bedrock-api-key
+```
+
+For Claude Haiku 4.5 in the same EU Region, the model can instead be:
+
+```env
+LLM_MODEL=eu.anthropic.claude-haiku-4-5-20251001-v1:0
+```
+
+Never put a real key in `.env.example`, source code, tests, screenshots, or Git. The private
+`.env` file is excluded by `.gitignore` and passed into the containers by Docker Compose.
+
+After changing application code, rebuild and recreate the services:
+
+```powershell
+docker compose up -d --build
+```
+
+After changing only `.env`, recreating the backend is sufficient:
+
+```powershell
+docker compose up -d --force-recreate backend
+```
+
+Inspect startup and processing logs with:
+
+```powershell
+docker compose logs -f backend
+```
+
+Verify the active non-secret configuration without displaying the key:
+
+```powershell
+docker compose exec backend python -c "import os; print('model:', os.getenv('LLM_MODEL')); print('region:', os.getenv('AWS_REGION')); print('token loaded:', bool(os.getenv('AWS_BEARER_TOKEN_BEDROCK')))"
+```
 
 ## Processing, retries, and recovery
 
@@ -99,6 +167,7 @@ On PowerShell, use `Copy-Item .env.example .env`.
 | `MAX_CONCURRENCY` | `5` | Number of worker tasks/provider calls |
 | `SHUTDOWN_GRACE_PERIOD` | `15` | Seconds to drain work before cancellation |
 | `AWS_REGION` | `us-east-1` | Bedrock Runtime region |
+| `AWS_BEARER_TOKEN_BEDROCK` | unset | Bedrock bearer API key; secret, only set in private `.env` or runtime environment |
 | `AWS_BEDROCK_ENDPOINT_URL` | unset | Optional custom Bedrock endpoint |
 | `LOG_LEVEL` | `INFO` | Python log level |
 | `LOG_FILE` | `./logs/medical_chat.log` | Rotating JSON-lines log path |
@@ -112,25 +181,41 @@ control.
 
 ### AWS Bedrock
 
-Set `LLM_PROVIDER=bedrock`, choose a Claude model available in `AWS_REGION`, and make sure model
-access is enabled for the account. The standard boto3 credential chain is used, so credentials
-may come from environment variables, an AWS credentials file/profile, workload identity, or an
-attached IAM role. The identity needs permission for `bedrock:InvokeModel` on the configured
-model. AWS credentials and authorization data are never deliberately logged.
+Set `LLM_PROVIDER=bedrock`, choose a Converse-compatible model or inference profile available from
+`AWS_REGION`, and make sure model access is enabled for the account. Geographic inference-profile
+prefixes must agree with the source Region: for example, use an `eu.` profile from `eu-north-1`
+and a `us.` profile from a supported US Region.
+
+The easiest Docker authentication method is a Bedrock API key in the private `.env` file:
+
+```env
+AWS_BEARER_TOKEN_BEDROCK=replace-with-your-real-bedrock-api-key
+```
+
+Boto3 also supports its standard credential chain: `AWS_ACCESS_KEY_ID` plus
+`AWS_SECRET_ACCESS_KEY` (and `AWS_SESSION_TOKEN` for temporary credentials), an AWS credentials
+file/profile, workload identity, or an attached IAM role. The identity needs
+`bedrock:InvokeModel` permission for the configured inference profile and its destination models.
+See the AWS documentation for [Bedrock API keys](https://docs.aws.amazon.com/bedrock/latest/userguide/api-keys-use.html)
+and [Converse](https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference.html).
+Credentials and authorization data are never deliberately logged.
 
 ## Run locally
 
 Python 3.11 or newer is required.
 
-```bash
+```powershell
 python -m venv .venv
+./.venv/Scripts/Activate.ps1
 python -m pip install -r requirements-dev.txt
+Copy-Item .env.example .env
 python -m backend.run
 ```
 
 In another terminal:
 
-```bash
+```powershell
+./.venv/Scripts/Activate.ps1
 streamlit run frontend/app.py
 ```
 
@@ -192,18 +277,15 @@ Unknown IDs return 404. Empty, missing, or overlong questions return 422.
 - `GET /conversations/{conversationId}` returns persisted messages in chronological order.
 - `GET /health` is a lightweight container health endpoint.
 
-## Docker
+## Docker lifecycle
 
-Run both services with the mock provider:
+The complete Docker setup is documented in [Quick start with Docker](#quick-start-with-docker).
+Named volumes retain the SQLite database and logs across container recreation. Stop the services
+without deleting their data using:
 
-```bash
-docker compose up --build
+```powershell
+docker compose down
 ```
-
-The UI is at `http://localhost:8501` and the API at `http://localhost:8000`. Named volumes retain
-the SQLite database and logs across container recreation. Environment values from the calling
-shell can override the Compose defaults; for Bedrock, export the provider/model/AWS settings
-before starting Compose.
 
 ## Tests
 
@@ -214,7 +296,8 @@ python -m pytest
 The test suite uses temporary SQLite files and `MockLLMProvider`; it never needs AWS credentials.
 It verifies immediate submission, processing/completion states, request and ID errors, retry
 success, retry exhaustion, persisted statistics, actual worker concurrency, chronological
-conversation context, and database survival across app restarts.
+conversation context, database survival across app restarts, and the model-independent Bedrock
+Converse request shape.
 
 ## Logging
 
@@ -238,7 +321,7 @@ Implemented core requirements:
 - Dedicated medical safety system prompt
 - Configurable retry delay/count and persisted retry metrics
 - Structured, concurrency-safe rotating logs
-- Bedrock Claude and mock providers behind one interface
+- Bedrock Converse and mock providers behind one interface
 - Streamlit submission, processing state, polling, failure handling, history, and statistics
 - Environment validation, `.env.example`, Dockerfiles, Compose, and automated tests
 
