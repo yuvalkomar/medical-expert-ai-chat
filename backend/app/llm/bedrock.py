@@ -1,5 +1,4 @@
 import asyncio
-import json
 from typing import Any
 
 import boto3
@@ -9,7 +8,7 @@ from backend.app.llm.base import ChatTurn, LLMProvider, ProviderError
 
 
 class BedrockLLMProvider(LLMProvider):
-    """Claude Messages API implementation through AWS Bedrock Runtime."""
+    """Model-agnostic implementation through AWS Bedrock Runtime Converse."""
 
     _NON_RETRYABLE_CODES = {
         "AccessDeniedException",
@@ -35,31 +34,26 @@ class BedrockLLMProvider(LLMProvider):
         self._client = boto3.client("bedrock-runtime", **client_options)
 
     async def generate(self, system_prompt: str, messages: list[ChatTurn]) -> str:
-        body = {
-            "anthropic_version": "bedrock-2023-05-31",
-            "system": system_prompt,
-            "messages": [
-                {"role": item.role, "content": [{"type": "text", "text": item.content}]}
-                for item in messages
-            ],
-            "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
-        }
-        return await asyncio.to_thread(self._invoke, body)
+        return await asyncio.to_thread(self._converse, system_prompt, messages)
 
-    def _invoke(self, body: dict[str, Any]) -> str:
+    def _converse(self, system_prompt: str, messages: list[ChatTurn]) -> str:
         try:
-            response = self._client.invoke_model(
+            response = self._client.converse(
                 modelId=self.model_id,
-                contentType="application/json",
-                accept="application/json",
-                body=json.dumps(body),
+                system=[{"text": system_prompt}],
+                messages=[
+                    {"role": item.role, "content": [{"text": item.content}]}
+                    for item in messages
+                ],
+                inferenceConfig={
+                    "temperature": self.temperature,
+                    "maxTokens": self.max_tokens,
+                },
             )
-            payload = json.loads(response["body"].read())
             text_parts = [
                 item.get("text", "")
-                for item in payload.get("content", [])
-                if item.get("type") == "text"
+                for item in response["output"]["message"].get("content", [])
+                if "text" in item
             ]
             answer = "".join(text_parts).strip()
             if not answer:
@@ -75,6 +69,5 @@ class BedrockLLMProvider(LLMProvider):
             ) from exc
         except BotoCoreError as exc:
             raise ProviderError(f"Bedrock connection failed: {exc}", retryable=True) from exc
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        except (KeyError, TypeError, ValueError) as exc:
             raise ProviderError("Bedrock returned an invalid response", retryable=True) from exc
-

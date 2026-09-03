@@ -50,7 +50,8 @@ session remains open during an external LLM call.
   fixes the maximum number of concurrent provider calls.
 - **A provider interface** isolates application logic from AWS. The mock implementation makes
   development and all tests deterministic and credential-free; the Bedrock implementation uses
-  Claude's Messages API request shape via Bedrock Runtime.
+  Bedrock Runtime's model-agnostic Converse API, supporting Claude, Amazon Nova, and other
+  conversational models.
 
 This is intentionally a self-contained assignment solution. In production, SQLite and the
 in-process queue could be replaced with a transactional database and durable broker/worker
@@ -248,9 +249,8 @@ Implemented bonuses:
 
 Not implemented:
 
-- **Token streaming:** polling remains deliberately simple and reliable. The current Bedrock
-  provider uses `InvokeModel`; adding `InvokeModelWithResponseStream` plus a persisted/event fanout
-  layer would be a separate enhancement.
+- **Token streaming:** polling remains deliberately simple and reliable. Adding `ConverseStream`
+  plus a persisted/event fanout layer would be a separate enhancement.
 
 ## Known limitations and production improvements
 
@@ -267,4 +267,3 @@ Not implemented:
 - Production observability would use centralized logs, traces, health/readiness separation, and
   exported metrics. A durable broker and scalable database would allow multiple API and worker
   processes.
-
