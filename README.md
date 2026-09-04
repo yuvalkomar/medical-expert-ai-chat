@@ -93,12 +93,6 @@ AWS_REGION=eu-north-1
 AWS_BEARER_TOKEN_BEDROCK=replace-with-your-real-bedrock-api-key
 ```
 
-For Claude Haiku 4.5 in the same EU Region, the model can instead be:
-
-```env
-LLM_MODEL=eu.anthropic.claude-haiku-4-5-20251001-v1:0
-```
-
 Never put a real key in `.env.example`, source code, tests, screenshots, or Git. The private
 `.env` file is excluded by `.gitignore` and passed into the containers by Docker Compose.
 
