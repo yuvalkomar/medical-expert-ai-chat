@@ -1,3 +1,11 @@
+"""Asynchronous message processing with bounded concurrency and persisted outcomes.
+
+The HTTP layer stores a message before placing its ID on this module's in-memory queue. A fixed
+number of workers then call the configured LLM provider, publish live response chunks, and save the
+terminal result to SQLite. SQLite remains the source of truth; the queue can therefore be rebuilt
+from messages left in the ``processing`` state after a service restart.
+"""
+
 import asyncio
 import logging
 from datetime import datetime, timezone
@@ -13,6 +21,7 @@ from backend.app.streaming import StreamRegistry
 
 
 def _elapsed_ms(started_at: datetime, completed_at: datetime) -> float:
+    """Return a non-negative duration while tolerating legacy naive timestamps."""
     if started_at.tzinfo is None:
         started_at = started_at.replace(tzinfo=timezone.utc)
     if completed_at.tzinfo is None:
@@ -21,7 +30,15 @@ def _elapsed_ms(started_at: datetime, completed_at: datetime) -> float:
 
 
 class WorkerPool:
-    """In-process queue with a fixed number of independently sessioned workers."""
+    """Manage a fixed set of workers consuming persisted chat-message IDs.
+
+    ``MAX_CONCURRENCY`` determines the number of worker tasks and therefore bounds simultaneous
+    LLM calls. Workers exchange IDs rather than ORM objects so every database operation uses a
+    short-lived session and no session remains open during a slow external request.
+
+    The queue is intentionally in-process for this self-contained service. Messages are written to
+    SQLite before enqueueing, and :meth:`start` recovers unfinished records after an interruption.
+    """
 
     def __init__(
         self,
@@ -42,6 +59,7 @@ class WorkerPool:
         self._accepting = False
 
     async def start(self) -> None:
+        """Start worker tasks and requeue messages interrupted by an earlier shutdown."""
         self._accepting = True
         self.tasks = [
             asyncio.create_task(self._worker(index), name=f"chat-worker-{index}")
@@ -59,12 +77,14 @@ class WorkerPool:
         self.logger.info("worker_pool_started", extra={"worker": len(self.tasks)})
 
     async def enqueue(self, message_id: str) -> None:
+        """Register a live stream and schedule an already-persisted message for processing."""
         if not self._accepting:
             raise RuntimeError("Worker pool is not accepting messages")
         self.stream_registry.create(message_id)
         await self.queue.put(message_id)
 
     async def stop(self) -> None:
+        """Drain queued work within the grace period, then cancel any remaining workers."""
         self._accepting = False
         try:
             await asyncio.wait_for(
@@ -76,6 +96,7 @@ class WorkerPool:
                 task.cancel()
             await asyncio.gather(*self.tasks, return_exceptions=True)
         else:
+            # A ``None`` sentinel lets each idle worker exit through its normal queue loop.
             for _ in self.tasks:
                 await self.queue.put(None)
             await asyncio.gather(*self.tasks, return_exceptions=True)
@@ -83,6 +104,7 @@ class WorkerPool:
         self.logger.info("worker_pool_stopped")
 
     async def _worker(self, index: int) -> None:
+        """Consume queue entries until shutdown sends this worker a sentinel."""
         while True:
             message_id = await self.queue.get()
             try:
@@ -100,6 +122,7 @@ class WorkerPool:
                 self.queue.task_done()
 
     def _load_request(self, message_id: str) -> tuple[ChatMessage, list[ChatTurn]] | None:
+        """Load one pending message and build its chronological, completed-only context."""
         with self.database.session() as session:
             message = session.get(ChatMessage, message_id)
             if message is None or message.status != MessageStatus.PROCESSING.value:
@@ -120,6 +143,7 @@ class WorkerPool:
                 .order_by(ChatMessage.created_at, ChatMessage.id)
             ).all()
             turns: list[ChatTurn] = []
+            # Failed or still-processing turns are excluded so the model sees only stable history.
             for prior in previous:
                 turns.append(ChatTurn(role="user", content=prior.question))
                 if prior.answer:
@@ -128,6 +152,7 @@ class WorkerPool:
             return message, turns
 
     async def _process_message(self, message_id: str, worker_index: int) -> None:
+        """Stream one answer, retry transient failures, and persist exactly one terminal state."""
         loaded = self._load_request(message_id)
         if loaded is None:
             return
@@ -145,6 +170,7 @@ class WorkerPool:
                 if not answer:
                     raise ProviderError("LLM provider returned an empty response")
                 self._save_success(message_id, answer)
+                # Persistence happens first so a completion event always describes durable data.
                 self.stream_registry.complete(message_id, answer)
                 self.logger.info(
                     "message_completed",
@@ -168,6 +194,7 @@ class WorkerPool:
 
             if not can_retry:
                 break
+            # Remove partial output from the failed attempt before publishing the next attempt.
             self.stream_registry.reset(message_id)
             self._record_retry(message_id)
             self.logger.warning(
@@ -201,6 +228,7 @@ class WorkerPool:
         )
 
     def _record_retry(self, message_id: str) -> None:
+        """Persist a retry immediately so metrics survive another process interruption."""
         with self.database.session() as session:
             message = session.get(ChatMessage, message_id)
             if message is not None:
@@ -209,11 +237,13 @@ class WorkerPool:
                 session.commit()
 
     def _get_retry_count(self, message_id: str) -> int:
+        """Read the durable retry count used in terminal errors and structured logs."""
         with self.database.session() as session:
             message = session.get(ChatMessage, message_id)
             return message.retry_count if message else 0
 
     def _save_success(self, message_id: str, answer: str) -> None:
+        """Atomically store a completed answer and its processing duration."""
         completed_at = utc_now()
         with self.database.session() as session:
             message = session.get(ChatMessage, message_id)
@@ -230,6 +260,7 @@ class WorkerPool:
             session.commit()
 
     def _save_failure(self, message_id: str, error: str) -> None:
+        """Atomically store a terminal failure and its processing duration."""
         completed_at = utc_now()
         with self.database.session() as session:
             message = session.get(ChatMessage, message_id)
