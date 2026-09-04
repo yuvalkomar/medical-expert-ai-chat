@@ -1,6 +1,6 @@
 # Medical Expert AI Chat
 
-A self-contained assignment implementation for submitting medical-information questions,
+A self-contained implementation for submitting medical-information questions,
 processing them asynchronously through an LLM, and retrieving answers and persisted statistics.
 It includes a FastAPI backend, a Streamlit HTTP client, SQLite persistence, an `asyncio.Queue`
 worker pool, AWS Bedrock and mock LLM providers, Server-Sent Events (SSE) streaming, structured
