@@ -203,6 +203,15 @@ See the AWS documentation for [Bedrock API keys](https://docs.aws.amazon.com/bed
 and [Converse](https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference.html).
 Credentials and authorization data are never deliberately logged.
 
+To make one explicit, real AWS streaming request with the Bedrock settings in `.env`, run:
+
+```powershell
+python scripts/bedrock_smoke_test.py "In one sentence, what is hydration?"
+```
+
+This smoke test calls AWS and may incur usage charges. It is intentionally separate from the
+automated test suite, which never calls external services.
+
 ## Run locally
 
 Python 3.11 or newer is required.

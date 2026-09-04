@@ -1,7 +1,7 @@
 import asyncio
 import time
 
-from backend.app.llm.base import ChatTurn, LLMProvider
+from backend.app.llm.base import ChatTurn, LLMProvider, ProviderError
 from backend.app.llm.mock import MockLLMProvider
 from tests.conftest import wait_for_terminal
 
@@ -16,6 +16,24 @@ class ChunkedProvider(LLMProvider):
         for chunk in ["Streamed ", "medical ", "response"]:
             await asyncio.sleep(0.01)
             yield chunk
+
+
+class PartialFailureProvider(LLMProvider):
+    def __init__(self) -> None:
+        self.attempts = 0
+
+    async def generate(self, system_prompt: str, messages: list[ChatTurn]) -> str:
+        del system_prompt, messages
+        return "Final response"
+
+    async def stream(self, system_prompt: str, messages: list[ChatTurn]):
+        del system_prompt, messages
+        self.attempts += 1
+        if self.attempts == 1:
+            yield "Partial response"
+            await asyncio.sleep(0.05)
+            raise ProviderError("Stream interrupted", retryable=True)
+        yield "Final response"
 
 
 def test_post_returns_immediately_and_message_completes(client_factory):
@@ -170,3 +188,23 @@ def test_sse_streams_chunks_and_preserves_polling_result(client_factory):
 def test_unknown_message_stream_returns_not_found(client_factory):
     with client_factory(MockLLMProvider(response_delay=0)) as client:
         assert client.get("/chat/not-a-real-id/stream").status_code == 404
+
+
+def test_streaming_retry_resets_partial_answer(client_factory):
+    provider = PartialFailureProvider()
+    with client_factory(provider, max_retries=1) as client:
+        created = client.post("/chat", json={"question": "Retry this"}).json()
+        stream_body = client.get(f'/chat/{created["messageId"]}/stream').text
+
+        partial_position = stream_body.index('data: {"text": "Partial response"}')
+        reset_position = stream_body.index("event: reset")
+        final_position = stream_body.index('data: {"text": "Final response"}')
+        assert partial_position < reset_position < final_position
+        assert "event: completed" in stream_body
+        assert provider.attempts == 2
+
+        polling_response = client.get(f'/chat/{created["messageId"]}').json()
+        assert polling_response == {
+            "status": "completed",
+            "answer": "Final response",
+        }

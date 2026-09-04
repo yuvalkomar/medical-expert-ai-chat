@@ -16,6 +16,13 @@ class BedrockLLMProvider(LLMProvider):
         "ResourceNotFoundException",
         "ValidationException",
     }
+    _STREAM_ERROR_EVENTS = {
+        "internalServerException": True,
+        "modelStreamErrorException": True,
+        "validationException": False,
+        "throttlingException": True,
+        "serviceUnavailableException": True,
+    }
 
     def __init__(
         self,
@@ -42,7 +49,7 @@ class BedrockLLMProvider(LLMProvider):
     ) -> AsyncIterator[str]:
         """Bridge Bedrock's blocking event stream into the application's async loop."""
         loop = asyncio.get_running_loop()
-        chunks: asyncio.Queue[str | BaseException | None] = asyncio.Queue()
+        chunks: asyncio.Queue[str | Exception | None] = asyncio.Queue()
 
         def produce() -> None:
             try:
@@ -50,11 +57,15 @@ class BedrockLLMProvider(LLMProvider):
                     **self._request(system_prompt, messages)
                 )
                 for event in response["stream"]:
+                    stream_error = self._stream_event_error(event)
+                    if stream_error is not None:
+                        loop.call_soon_threadsafe(chunks.put_nowait, stream_error)
+                        return
                     delta = event.get("contentBlockDelta", {}).get("delta", {})
                     text = delta.get("text")
                     if text:
                         loop.call_soon_threadsafe(chunks.put_nowait, text)
-            except BaseException as exc:
+            except Exception as exc:
                 loop.call_soon_threadsafe(chunks.put_nowait, exc)
             finally:
                 loop.call_soon_threadsafe(chunks.put_nowait, None)
@@ -65,7 +76,7 @@ class BedrockLLMProvider(LLMProvider):
                 item = await chunks.get()
                 if item is None:
                     break
-                if isinstance(item, BaseException):
+                if isinstance(item, Exception):
                     raise self._provider_error(item)
                 yield item
             await producer
@@ -85,10 +96,21 @@ class BedrockLLMProvider(LLMProvider):
             if not answer:
                 raise ProviderError("Bedrock returned an empty response", retryable=True)
             return answer
-        except BaseException as exc:
-            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
-                raise
+        except Exception as exc:
             raise self._provider_error(exc) from exc
+
+    def _stream_event_error(self, event: dict[str, Any]) -> ProviderError | None:
+        for event_name, retryable in self._STREAM_ERROR_EVENTS.items():
+            details = event.get(event_name)
+            if details is None:
+                continue
+            message = details.get("message") or details.get("originalMessage")
+            return ProviderError(
+                f"Bedrock stream failed ({event_name}): "
+                f"{message or 'Unknown stream error'}",
+                retryable=retryable,
+            )
+        return None
 
     def _request(
         self, system_prompt: str, messages: list[ChatTurn]
@@ -106,7 +128,7 @@ class BedrockLLMProvider(LLMProvider):
             },
         }
 
-    def _provider_error(self, exc: BaseException) -> ProviderError:
+    def _provider_error(self, exc: Exception) -> ProviderError:
         if isinstance(exc, ProviderError):
             return exc
         if isinstance(exc, ClientError):

@@ -1,4 +1,3 @@
-from collections.abc import Iterator
 from pathlib import Path
 
 from sqlalchemy import Engine, event
@@ -48,10 +47,3 @@ class Database:
 
     def dispose(self) -> None:
         self.engine.dispose()
-
-
-def session_scope(database: Database) -> Iterator[Session]:
-    """Small generator useful as a FastAPI dependency."""
-    with database.session() as session:
-        yield session
-
