@@ -1,6 +1,6 @@
 import asyncio
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 
 from backend.app.llm.base import ChatTurn, LLMProvider, ProviderError
 
@@ -15,11 +15,13 @@ class MockLLMProvider(LLMProvider):
         failures_before_success: int = 0,
         always_fail_questions: set[str] | None = None,
         response_factory: Callable[[list[ChatTurn]], str] | None = None,
+        stream_chunk_delay: float = 0.01,
     ) -> None:
         self.response_delay = response_delay
         self.failures_before_success = failures_before_success
         self.always_fail_questions = always_fail_questions or set()
         self.response_factory = response_factory
+        self.stream_chunk_delay = stream_chunk_delay
         self.attempts: dict[str, int] = defaultdict(int)
         self.calls: list[list[ChatTurn]] = []
         self.active_calls = 0
@@ -51,3 +53,12 @@ class MockLLMProvider(LLMProvider):
             async with self._state_lock:
                 self.active_calls -= 1
 
+    async def stream(
+        self, system_prompt: str, messages: list[ChatTurn]
+    ) -> AsyncIterator[str]:
+        answer = await self.generate(system_prompt, messages)
+        words = answer.split(" ")
+        for index, word in enumerate(words):
+            if self.stream_chunk_delay:
+                await asyncio.sleep(self.stream_chunk_delay)
+            yield word if index == len(words) - 1 else f"{word} "

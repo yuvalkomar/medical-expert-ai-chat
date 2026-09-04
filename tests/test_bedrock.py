@@ -19,6 +19,19 @@ class FakeBedrockRuntimeClient:
             }
         }
 
+    def converse_stream(self, **kwargs: object) -> dict[str, object]:
+        self.request = kwargs
+        return {
+            "stream": iter(
+                [
+                    {"messageStart": {"role": "assistant"}},
+                    {"contentBlockDelta": {"delta": {"text": "Streamed "}}},
+                    {"contentBlockDelta": {"delta": {"text": "answer"}}},
+                    {"messageStop": {"stopReason": "end_turn"}},
+                ]
+            )
+        }
+
 
 def test_bedrock_provider_uses_model_agnostic_converse(monkeypatch):
     fake_client = FakeBedrockRuntimeClient()
@@ -53,5 +66,36 @@ def test_bedrock_provider_uses_model_agnostic_converse(monkeypatch):
             {"role": "assistant", "content": [{"text": "First answer"}]},
             {"role": "user", "content": [{"text": "Follow-up"}]},
         ],
+        "inferenceConfig": {"temperature": 0.2, "maxTokens": 1000},
+    }
+
+
+def test_bedrock_provider_bridges_converse_stream(monkeypatch):
+    fake_client = FakeBedrockRuntimeClient()
+    monkeypatch.setattr(
+        "backend.app.llm.bedrock.boto3.client",
+        lambda *args, **kwargs: fake_client,
+    )
+    provider = BedrockLLMProvider(
+        model_id="eu.amazon.nova-pro-v1:0",
+        region_name="eu-north-1",
+        temperature=0.2,
+        max_tokens=1000,
+    )
+
+    async def collect_chunks() -> list[str]:
+        return [
+            chunk
+            async for chunk in provider.stream(
+                "Medical system prompt",
+                [ChatTurn(role="user", content="Question")],
+            )
+        ]
+
+    assert asyncio.run(collect_chunks()) == ["Streamed ", "answer"]
+    assert fake_client.request == {
+        "modelId": "eu.amazon.nova-pro-v1:0",
+        "system": [{"text": "Medical system prompt"}],
+        "messages": [{"role": "user", "content": [{"text": "Question"}]}],
         "inferenceConfig": {"temperature": 0.2, "maxTokens": 1000},
     }

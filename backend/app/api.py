@@ -1,4 +1,8 @@
+import json
+from collections.abc import AsyncIterator
+
 from fastapi import APIRouter, HTTPException, Request, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy import func
 from sqlmodel import select
 
@@ -12,6 +16,7 @@ from backend.app.schemas import (
     ConversationResponse,
     StatisticsResponse,
 )
+from backend.app.streaming import StreamEvent, StreamRegistry
 from backend.app.workers import WorkerPool
 
 router = APIRouter()
@@ -80,6 +85,59 @@ async def get_chat(message_id: str, request: Request) -> ChatStatusResponse:
             answer=message.answer if message.status == MessageStatus.COMPLETED.value else None,
             error=message.error if message.status == MessageStatus.FAILED.value else None,
         )
+
+
+def _encode_sse(event: StreamEvent) -> str:
+    return (
+        f"event: {event.event}\n"
+        f"data: {json.dumps(event.data, ensure_ascii=False)}\n\n"
+    )
+
+
+@router.get("/chat/{message_id}/stream", response_class=StreamingResponse)
+async def stream_chat(message_id: str, request: Request) -> StreamingResponse:
+    """Stream response chunks as Server-Sent Events while polling remains available."""
+    database, _ = _resources(request)
+    stream_registry: StreamRegistry = request.app.state.stream_registry
+    with database.session() as session:
+        message = session.get(ChatMessage, message_id)
+        if message is None:
+            raise HTTPException(status_code=404, detail="Message not found")
+        current_status = message.status
+        current_answer = message.answer
+        current_error = message.error
+
+    async def events() -> AsyncIterator[str]:
+        if current_status == MessageStatus.COMPLETED.value:
+            yield _encode_sse(
+                StreamEvent(
+                    "completed",
+                    {"status": "completed", "answer": current_answer or ""},
+                )
+            )
+            return
+        if current_status == MessageStatus.FAILED.value:
+            yield _encode_sse(
+                StreamEvent(
+                    "failed",
+                    {"status": "failed", "error": current_error or "Unknown error"},
+                )
+            )
+            return
+        async for event in stream_registry.subscribe(message_id):
+            if await request.is_disconnected():
+                return
+            yield _encode_sse(event)
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.get("/statistics", response_model=StatisticsResponse)

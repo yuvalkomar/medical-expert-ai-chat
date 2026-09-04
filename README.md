@@ -3,9 +3,10 @@
 A self-contained assignment implementation for submitting medical-information questions,
 processing them asynchronously through an LLM, and retrieving answers and persisted statistics.
 It includes a FastAPI backend, a Streamlit HTTP client, SQLite persistence, an `asyncio.Queue`
-worker pool, AWS Bedrock and mock LLM providers, structured logging, retries, tests, and Docker
-support. Bedrock is accessed through its model-independent Converse API, so the configured model
-can be Anthropic Claude, Amazon Nova, or another Converse-compatible model.
+worker pool, AWS Bedrock and mock LLM providers, Server-Sent Events (SSE) streaming, structured
+logging, retries, tests, and Docker support. Bedrock is accessed through its model-independent
+Converse APIs, so the configured model can be Anthropic Claude, Amazon Nova, or another
+Converse-compatible model.
 
 This application provides general medical information. It is not a diagnostic tool and does not
 replace a licensed healthcare professional.
@@ -15,7 +16,7 @@ replace a licensed healthcare professional.
 ```text
 Streamlit client
       |
-      | HTTP: submit, poll, statistics
+      | HTTP: submit, SSE stream/poll, statistics
       v
 FastAPI  --->  SQLite (conversations, messages, status, metrics)
       |
@@ -24,7 +25,7 @@ FastAPI  --->  SQLite (conversations, messages, status, metrics)
 asyncio.Queue  --->  fixed async worker pool
                            |
                            v
-                    LLMProvider interface
+                    LLMProvider interface + chunks
                        /          \
              Mock provider      AWS Bedrock Runtime
                                       |
@@ -52,8 +53,8 @@ session remains open during an external LLM call.
   fixes the maximum number of concurrent provider calls.
 - **A provider interface** isolates application logic from AWS. The mock implementation makes
   development and all tests deterministic and credential-free; the Bedrock implementation uses
-  Bedrock Runtime's model-agnostic Converse API, supporting Claude, Amazon Nova, and other
-  conversational models.
+  Bedrock Runtime's model-agnostic `Converse`/`ConverseStream` APIs, supporting Claude, Amazon
+  Nova, and other conversational models.
 
 This is intentionally a self-contained assignment solution. In production, SQLite and the
 in-process queue could be replaced with a transactional database and durable broker/worker
@@ -131,12 +132,19 @@ Each worker loads only previous **completed** question/answer pairs from the sam
 in chronological order. Those pairs and the current question are passed as chat messages; the
 medical system prompt remains a separate provider argument.
 
+For a streaming-capable provider, the worker publishes response chunks to an in-memory fan-out
+registry while assembling the same answer for SQLite. `GET /chat/{messageId}/stream` exposes those
+chunks as SSE. A client that connects after generation starts receives the retained chunks first.
+The Streamlit client renders chunks incrementally and falls back to the required polling endpoint
+if its live connection is interrupted.
+
 An initial provider attempt may be followed by up to `MAX_RETRIES` additional attempts. A failed
 retryable call increments the message's persisted `retry_count`, logs the event, waits
 `RETRY_DELAY` seconds, and tries again. Non-retryable provider errors (for example a Bedrock
 validation or access-denied error) fail immediately. Terminal results persist timestamps and
 `processing_time_ms`; `/statistics` calculates its values from the database rather than volatile
-counters.
+counters. If a streaming attempt emits partial text and then fails, subscribers receive a `reset`
+event before the retry; only the final successful attempt is persisted.
 
 During normal shutdown the backend lets queued work finish for up to
 `SHUTDOWN_GRACE_PERIOD`. Any message still marked `processing` after interruption is discovered
@@ -195,7 +203,8 @@ AWS_BEARER_TOKEN_BEDROCK=replace-with-your-real-bedrock-api-key
 Boto3 also supports its standard credential chain: `AWS_ACCESS_KEY_ID` plus
 `AWS_SECRET_ACCESS_KEY` (and `AWS_SESSION_TOKEN` for temporary credentials), an AWS credentials
 file/profile, workload identity, or an attached IAM role. The identity needs
-`bedrock:InvokeModel` permission for the configured inference profile and its destination models.
+`bedrock:InvokeModel` and `bedrock:InvokeModelWithResponseStream` permissions for the configured
+inference profile and its destination models.
 See the AWS documentation for [Bedrock API keys](https://docs.aws.amazon.com/bedrock/latest/userguide/api-keys-use.html)
 and [Converse](https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference.html).
 Credentials and authorization data are never deliberately logged.
@@ -269,6 +278,26 @@ To continue a conversation, include the returned ID:
 
 Unknown IDs return 404. Empty, missing, or overlong questions return 422.
 
+### Stream a message
+
+`GET /chat/{messageId}/stream` returns `text/event-stream`. It can be opened immediately after
+`POST /chat` and emits events such as:
+
+```text
+event: chunk
+data: {"text":"Iron"}
+
+event: chunk
+data: {"text":" deficiency..."}
+
+event: completed
+data: {"status":"completed","answer":"Iron deficiency..."}
+```
+
+Possible event names are `chunk`, `reset`, `completed`, `failed`, and `ping`. The `completed`
+event includes the full persisted answer. The polling API remains fully supported independently
+of SSE.
+
 ### Statistics and history
 
 - `GET /statistics` returns `messagesProcessed`, `messagesSucceeded`, `messagesFailed`,
@@ -296,8 +325,8 @@ python -m pytest
 The test suite uses temporary SQLite files and `MockLLMProvider`; it never needs AWS credentials.
 It verifies immediate submission, processing/completion states, request and ID errors, retry
 success, retry exhaustion, persisted statistics, actual worker concurrency, chronological
-conversation context, database survival across app restarts, and the model-independent Bedrock
-Converse request shape.
+conversation context, database survival across app restarts, SSE delivery and retry resets, the
+polling fallback contract, and Bedrock `ConverseStream` chunk bridging.
 
 ## Logging
 
@@ -322,18 +351,16 @@ Implemented core requirements:
 - Configurable retry delay/count and persisted retry metrics
 - Structured, concurrency-safe rotating logs
 - Bedrock Converse and mock providers behind one interface
-- Streamlit submission, processing state, polling, failure handling, history, and statistics
+- Streamlit submission, live SSE rendering, polling fallback, failure handling, history, and
+  statistics
 - Environment validation, `.env.example`, Dockerfiles, Compose, and automated tests
 
 Implemented bonuses:
 
 - **Continuous chat:** completed conversation history is supplied to the provider.
 - **Persistence across restarts:** schema/data are retained and unfinished records are recovered.
-
-Not implemented:
-
-- **Token streaming:** polling remains deliberately simple and reliable. Adding `ConverseStream`
-  plus a persisted/event fanout layer would be a separate enhancement.
+- **Streaming responses:** Bedrock `ConverseStream` chunks flow through an SSE endpoint to
+  Streamlit while the final answer is still assembled and persisted for polling.
 
 ## Known limitations and production improvements
 
@@ -343,6 +370,9 @@ Not implemented:
   evolving a production schema.
 - Conversation context is not token-budgeted or summarized, so very long conversations can exceed
   model limits.
+- Live stream chunks and subscriber state are in-process. Reconnecting to the same running process
+  replays retained chunks; after a restart, terminal answers remain available from SQLite but
+  already-emitted chunk boundaries are not persisted.
 - Retries use a fixed delay; production code would normally add exponential backoff, jitter,
   provider-specific throttling behavior, timeouts, and a circuit breaker.
 - The assignment intentionally omits authentication, authorization, real medical validation,

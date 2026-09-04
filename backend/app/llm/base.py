@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Literal
 
@@ -22,3 +23,8 @@ class LLMProvider(ABC):
     async def generate(self, system_prompt: str, messages: list[ChatTurn]) -> str:
         """Generate one assistant response for the supplied chronological messages."""
 
+    async def stream(
+        self, system_prompt: str, messages: list[ChatTurn]
+    ) -> AsyncIterator[str]:
+        """Yield response text chunks, falling back to one complete generated chunk."""
+        yield await self.generate(system_prompt, messages)

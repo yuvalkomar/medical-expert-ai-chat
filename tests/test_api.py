@@ -1,7 +1,21 @@
+import asyncio
 import time
 
+from backend.app.llm.base import ChatTurn, LLMProvider
 from backend.app.llm.mock import MockLLMProvider
 from tests.conftest import wait_for_terminal
+
+
+class ChunkedProvider(LLMProvider):
+    async def generate(self, system_prompt: str, messages: list[ChatTurn]) -> str:
+        del system_prompt, messages
+        return "Streamed response"
+
+    async def stream(self, system_prompt: str, messages: list[ChatTurn]):
+        del system_prompt, messages
+        for chunk in ["Streamed ", "medical ", "response"]:
+            await asyncio.sleep(0.01)
+            yield chunk
 
 
 def test_post_returns_immediately_and_message_completes(client_factory):
@@ -132,3 +146,27 @@ def test_database_survives_application_restart(client_factory):
         assert persisted.json()["status"] == "completed"
         assert client.get("/statistics").json()["messagesProcessed"] == 1
 
+
+def test_sse_streams_chunks_and_preserves_polling_result(client_factory):
+    with client_factory(ChunkedProvider()) as client:
+        created = client.post("/chat", json={"question": "Stream this"}).json()
+        with client.stream("GET", f'/chat/{created["messageId"]}/stream') as response:
+            assert response.status_code == 200
+            assert response.headers["content-type"].startswith("text/event-stream")
+            stream_body = "".join(response.iter_text())
+
+        assert stream_body.count("event: chunk") == 3
+        assert 'data: {"text": "Streamed "}' in stream_body
+        assert "event: completed" in stream_body
+        assert '"answer": "Streamed medical response"' in stream_body
+        polling_response = client.get(f'/chat/{created["messageId"]}')
+        assert polling_response.status_code == 200
+        assert polling_response.json() == {
+            "status": "completed",
+            "answer": "Streamed medical response",
+        }
+
+
+def test_unknown_message_stream_returns_not_found(client_factory):
+    with client_factory(MockLLMProvider(response_delay=0)) as client:
+        assert client.get("/chat/not-a-real-id/stream").status_code == 404

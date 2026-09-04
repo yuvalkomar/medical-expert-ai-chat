@@ -9,6 +9,7 @@ from backend.app.database import Database
 from backend.app.llm.base import ChatTurn, LLMProvider, ProviderError
 from backend.app.models import ChatMessage, MessageStatus, utc_now
 from backend.app.prompts import MEDICAL_SYSTEM_PROMPT
+from backend.app.streaming import StreamRegistry
 
 
 def _elapsed_ms(started_at: datetime, completed_at: datetime) -> float:
@@ -29,11 +30,13 @@ class WorkerPool:
         provider: LLMProvider,
         settings: Settings,
         logger: logging.Logger,
+        stream_registry: StreamRegistry,
     ) -> None:
         self.database = database
         self.provider = provider
         self.settings = settings
         self.logger = logger
+        self.stream_registry = stream_registry
         self.queue: asyncio.Queue[str | None] = asyncio.Queue()
         self.tasks: list[asyncio.Task[None]] = []
         self._accepting = False
@@ -51,12 +54,14 @@ class WorkerPool:
                 .order_by(ChatMessage.created_at)
             ).all()
         for message_id in unfinished:
+            self.stream_registry.create(message_id)
             await self.queue.put(message_id)
         self.logger.info("worker_pool_started", extra={"worker": len(self.tasks)})
 
     async def enqueue(self, message_id: str) -> None:
         if not self._accepting:
             raise RuntimeError("Worker pool is not accepting messages")
+        self.stream_registry.create(message_id)
         await self.queue.put(message_id)
 
     async def stop(self) -> None:
@@ -131,8 +136,16 @@ class WorkerPool:
 
         for retry_number in range(self.settings.max_retries + 1):
             try:
-                answer = await self.provider.generate(MEDICAL_SYSTEM_PROMPT, turns)
+                answer_parts: list[str] = []
+                async for chunk in self.provider.stream(MEDICAL_SYSTEM_PROMPT, turns):
+                    if chunk:
+                        answer_parts.append(chunk)
+                        self.stream_registry.publish(message_id, chunk)
+                answer = "".join(answer_parts).strip()
+                if not answer:
+                    raise ProviderError("LLM provider returned an empty response")
                 self._save_success(message_id, answer)
+                self.stream_registry.complete(message_id, answer)
                 self.logger.info(
                     "message_completed",
                     extra={
@@ -155,6 +168,7 @@ class WorkerPool:
 
             if not can_retry:
                 break
+            self.stream_registry.reset(message_id)
             self._record_retry(message_id)
             self.logger.warning(
                 "message_retry_scheduled",
@@ -174,6 +188,7 @@ class WorkerPool:
             f"{final_error or 'unknown provider error'}"
         )
         self._save_failure(message_id, error_message)
+        self.stream_registry.fail(message_id, error_message)
         self.logger.error(
             "message_failed",
             extra={
@@ -228,4 +243,3 @@ class WorkerPool:
             )
             session.add(message)
             session.commit()
-
